@@ -950,8 +950,6 @@ init_db()
 # Main monitoring loop
 while True:
     try:
-        global first_loop_iteration
-
         # Process reviews
         stats = fetch_and_process_reviews()
         post_notification(stats)
