@@ -542,13 +542,18 @@ def set_metadata(key, value):
         print(f"ERROR: Failed to set metadata: {e}", flush=True)
 
 
-def get_reviews_for_summary(days_back=7, limit=100):
-    """Query reviews from last N days for AI summary."""
+def get_reviews_for_summary(since_timestamp=None, days_back=7, limit=100):
+    """Query reviews since last summary (or last N days if first run) for AI summary."""
     try:
         conn = sqlite3.connect(DB_PATH, timeout=10)
         cursor = conn.cursor()
 
-        cutoff_time = int(time.time()) - (days_back * 24 * 60 * 60)
+        # If we have a timestamp from last summary, use that; otherwise use days_back
+        if since_timestamp is not None:
+            cutoff_time = since_timestamp
+        else:
+            cutoff_time = int(time.time()) - (days_back * 24 * 60 * 60)
+
         cursor.execute('''
             SELECT review, voted_up, timestamp_created
             FROM reviews
@@ -572,13 +577,18 @@ def get_reviews_for_summary(days_back=7, limit=100):
         return []
 
 
-def get_discussions_for_summary(days_back=7, limit=100):
-    """Query discussions from last N days for AI summary."""
+def get_discussions_for_summary(since_timestamp=None, days_back=7, limit=100):
+    """Query discussions since last summary (or last N days if first run) for AI summary."""
     try:
         conn = sqlite3.connect(DB_PATH, timeout=10)
         cursor = conn.cursor()
 
-        cutoff_time = int(time.time()) - (days_back * 24 * 60 * 60)
+        # If we have a timestamp from last summary, use that; otherwise use days_back
+        if since_timestamp is not None:
+            cutoff_time = since_timestamp
+        else:
+            cutoff_time = int(time.time()) - (days_back * 24 * 60 * 60)
+
         cursor.execute('''
             SELECT title, content_snippet, reply_count, timestamp_created
             FROM discussions
@@ -723,16 +733,21 @@ def format_discussions_for_prompt(discussions):
     return "\n".join(formatted)
 
 
-def build_summary_prompt(reviews_data, discussions_data):
+def build_summary_prompt(reviews_data, discussions_data, is_first_run=False):
     """Build structured prompt for OpenAI API."""
     game_name = get_game_name()
-    days = AI_SUMMARY_DAYS_LOOKBACK
 
     # Count positive/negative
     positive = [r for r in reviews_data if r.get('voted_up')]
     negative = [r for r in reviews_data if not r.get('voted_up')]
 
-    prompt = f"""Analyze the following Steam community feedback for {game_name} from the last {days} days.
+    # Adjust time context based on whether this is first run or incremental
+    if is_first_run:
+        time_context = f"from the last {AI_SUMMARY_DAYS_LOOKBACK} days"
+    else:
+        time_context = "since the last check"
+
+    prompt = f"""Analyze the following NEW Steam community feedback for {game_name} {time_context}.
 
 REVIEWS ({len(reviews_data)} total: {len(positive)} positive, {len(negative)} negative):
 
@@ -756,13 +771,13 @@ Keep the summary under 1000 words and focus on actionable insights for developer
     return prompt
 
 
-def generate_ai_summary(reviews_data, discussions_data):
+def generate_ai_summary(reviews_data, discussions_data, is_first_run=False):
     """Generate AI summary using OpenAI API."""
     try:
         client = OpenAI(api_key=OPENAI_API_KEY)
 
         # Build prompt with structured data
-        prompt = build_summary_prompt(reviews_data, discussions_data)
+        prompt = build_summary_prompt(reviews_data, discussions_data, is_first_run)
 
         # API call with configured model
         max_tokens = int(AI_SUMMARY_MAX_CHARS / 0.75)  # ~4 chars per token
@@ -837,19 +852,40 @@ def fetch_and_generate_summary():
     global last_summary_time
 
     try:
-        # Fetch data for summary
-        reviews_data = get_reviews_for_summary(AI_SUMMARY_DAYS_LOOKBACK, AI_SUMMARY_MAX_INPUT_ITEMS)
-        discussions_data = get_discussions_for_summary(AI_SUMMARY_DAYS_LOOKBACK, AI_SUMMARY_MAX_INPUT_ITEMS)
+        # Get timestamp of last summary
+        last_summary_str = get_metadata("last_summary_timestamp")
+        since_timestamp = int(last_summary_str) if last_summary_str else None
+
+        # Fetch data for summary (since last summary, or last N days if first run)
+        reviews_data = get_reviews_for_summary(
+            since_timestamp=since_timestamp,
+            days_back=AI_SUMMARY_DAYS_LOOKBACK,
+            limit=AI_SUMMARY_MAX_INPUT_ITEMS
+        )
+        discussions_data = get_discussions_for_summary(
+            since_timestamp=since_timestamp,
+            days_back=AI_SUMMARY_DAYS_LOOKBACK,
+            limit=AI_SUMMARY_MAX_INPUT_ITEMS
+        )
 
         # Check if we have any data
         if not reviews_data and not discussions_data:
-            print(f"SKIP No data for AI summary (last {AI_SUMMARY_DAYS_LOOKBACK} days)", flush=True)
+            if since_timestamp:
+                print(f"SKIP No new data for AI summary since last check", flush=True)
+            else:
+                print(f"SKIP No data for AI summary (last {AI_SUMMARY_DAYS_LOOKBACK} days)", flush=True)
             return None
 
-        print(f"Generating AI summary: {len(reviews_data)} reviews, {len(discussions_data)} discussions", flush=True)
+        # Log what we're analyzing
+        if since_timestamp:
+            time_range = f"since last check ({int((time.time() - since_timestamp) / 3600)}h ago)"
+        else:
+            time_range = f"last {AI_SUMMARY_DAYS_LOOKBACK} days (first run)"
+
+        print(f"Generating AI summary: {len(reviews_data)} reviews, {len(discussions_data)} discussions ({time_range})", flush=True)
 
         # Generate summary
-        summary = generate_ai_summary(reviews_data, discussions_data)
+        summary = generate_ai_summary(reviews_data, discussions_data, since_timestamp is None)
 
         if summary:
             # Update last summary time
@@ -860,7 +896,7 @@ def fetch_and_generate_summary():
                 'summary': summary,
                 'review_count': len(reviews_data),
                 'discussion_count': len(discussions_data),
-                'days_analyzed': AI_SUMMARY_DAYS_LOOKBACK
+                'time_range': time_range
             }
 
         return None
@@ -918,7 +954,7 @@ def post_ai_summary_notification(summary_data):
         f"🤖 **AI Summary - {game_name}** (Steam ID: {APPID})\n"
         f"📊 Analyzed: {summary_data['review_count']} reviews, "
         f"{summary_data['discussion_count']} discussions "
-        f"({summary_data['days_analyzed']} days)\n"
+        f"({summary_data['time_range']})\n"
         f"🕒 UTC: {datetime.utcnow():%Y-%m-%d %H:%M}\n\n"
     )
 
