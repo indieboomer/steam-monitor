@@ -1,8 +1,10 @@
 import os
 import time
 import sqlite3
+import re
 import requests
 from datetime import datetime
+from bs4 import BeautifulSoup
 
 # Configuration
 APPID = os.environ["STEAM_APPID"]
@@ -12,6 +14,29 @@ NOTIFY_ON_ZERO_NEW = os.environ.get("NOTIFY_ON_ZERO_NEW", "false").lower() == "t
 DB_PATH = "/data/reviews.db"
 
 URL = f"https://store.steampowered.com/appreviews/{APPID}?json=1&filter=recent&language=all&num_per_page=20"
+
+
+# Helper functions for discussion scraping
+def parse_steam_timestamp(text):
+    """Parse Steam's timestamp format to Unix timestamp."""
+    # Steam uses various formats: "2 hours ago", "Jan 15 @ 3:45pm", etc.
+    # For MVP: return current time as fallback
+    # TODO: Implement full timestamp parser if needed
+    try:
+        # Basic parsing - for now just return current time
+        return int(time.time())
+    except:
+        return int(time.time())
+
+
+def extract_number(element, keyword):
+    """Extract number from text containing keyword (e.g., '15 replies')."""
+    try:
+        text = element.text if hasattr(element, 'text') else str(element)
+        match = re.search(r'(\d+)\s*' + keyword, text, re.IGNORECASE)
+        return int(match.group(1)) if match else 0
+    except:
+        return 0
 
 
 def init_db():
@@ -40,9 +65,30 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_voted_up ON reviews(voted_up)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp_fetched ON reviews(timestamp_fetched)')
 
+        # Create discussions table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS discussions (
+                gid_discussion TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                author_steamid TEXT NOT NULL,
+                author_name TEXT,
+                timestamp_created INTEGER NOT NULL,
+                content_snippet TEXT,
+                reply_count INTEGER DEFAULT 0,
+                view_count INTEGER DEFAULT 0,
+                is_pinned INTEGER DEFAULT 0,
+                timestamp_fetched INTEGER NOT NULL
+            )
+        ''')
+
+        # Create indexes for discussions
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp_created ON discussions(timestamp_created)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp_fetched_disc ON discussions(timestamp_fetched)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_is_pinned ON discussions(is_pinned)')
+
         conn.commit()
         conn.close()
-        print("DB initialized successfully", flush=True)
+        print("DB initialized successfully (reviews + discussions)", flush=True)
     except sqlite3.Error as e:
         print(f"ERROR: Database initialization failed: {e}", flush=True)
 
@@ -229,16 +275,277 @@ def post_notification(stats):
     except requests.RequestException as e:
         print(f"ERROR: Discord webhook failed: {e}", flush=True)
 
+
+# Discussion monitoring functions
+def fetch_discussions():
+    """Fetch and parse discussions from Steam community forums."""
+    url = f"https://steamcommunity.com/app/{APPID}/discussions/0/"
+
+    try:
+        # Add headers to mimic browser request
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+
+        # Parse HTML with BeautifulSoup
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        discussions = []
+        # Find discussion containers - NOTE: These selectors may need adjustment after testing
+        # Steam forums structure: looking for discussion topics
+        topic_containers = soup.find_all('div', class_='forum_topic')
+
+        if not topic_containers:
+            print("WARNING: No discussion containers found - HTML structure may have changed", flush=True)
+            return []
+
+        for topic in topic_containers[:20]:  # Limit to first 20 discussions
+            try:
+                # Extract discussion link and gid
+                link = topic.find('a', class_='forum_topic_name')
+                if not link:
+                    continue
+
+                href = link.get('href', '')
+                title = link.text.strip()
+
+                # Extract gid from URL pattern: .../discussions/0/GIDHERE/
+                gid_match = re.search(r'/discussions/\d+/(\d+)/', href)
+                if not gid_match:
+                    continue
+
+                gid = gid_match.group(1)
+
+                # Extract author information
+                author_link = topic.find('a', class_='forum_topic_author')
+                author_name = author_link.text.strip() if author_link else 'Unknown'
+                author_steamid = ''  # May need to extract from profile link if available
+
+                # Timestamp (using current time as fallback per plan)
+                timestamp = int(time.time())
+
+                # Reply/view counts
+                stats_div = topic.find('div', class_='forum_topic_stats')
+                reply_count = extract_number(stats_div, 'replies?') if stats_div else 0
+                view_count = 0  # Views may not be available in list view
+
+                # Check if pinned
+                is_pinned = 1 if topic.find(class_='forum_topic_pinned') or 'sticky' in topic.get('class', []) else 0
+
+                # Content snippet from preview
+                preview_div = topic.find('div', class_='forum_topic_preview')
+                content_snippet = preview_div.text.strip()[:200] if preview_div else ''
+
+                discussions.append({
+                    'gid_discussion': gid,
+                    'title': title,
+                    'author_steamid': author_steamid,
+                    'author_name': author_name,
+                    'timestamp_created': timestamp,
+                    'content_snippet': content_snippet,
+                    'reply_count': reply_count,
+                    'view_count': view_count,
+                    'is_pinned': is_pinned
+                })
+
+            except Exception as e:
+                print(f"ERROR: Failed to parse discussion element: {e}", flush=True)
+                continue
+
+        return discussions
+
+    except requests.RequestException as e:
+        print(f"ERROR: Failed to fetch discussions: {e}", flush=True)
+        return None
+    except Exception as e:
+        print(f"ERROR: Failed to parse discussions HTML: {e}", flush=True)
+        return None
+
+
+def get_existing_discussion_ids(discussion_ids):
+    """Check which discussion IDs already exist in database."""
+    if not discussion_ids:
+        return set()
+
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        cursor = conn.cursor()
+
+        placeholders = ','.join('?' * len(discussion_ids))
+        cursor.execute(
+            f'SELECT gid_discussion FROM discussions WHERE gid_discussion IN ({placeholders})',
+            discussion_ids
+        )
+
+        existing = {row[0] for row in cursor.fetchall()}
+        conn.close()
+        return existing
+    except sqlite3.Error as e:
+        print(f"ERROR: Failed to check existing discussions: {e}", flush=True)
+        return set()
+
+
+def insert_discussions(new_discussions):
+    """Insert new discussions into database."""
+    if not new_discussions:
+        return
+
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        cursor = conn.cursor()
+        timestamp_now = int(time.time())
+
+        for disc in new_discussions:
+            try:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO discussions (
+                        gid_discussion, title, author_steamid, author_name,
+                        timestamp_created, content_snippet, reply_count,
+                        view_count, is_pinned, timestamp_fetched
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    disc.get('gid_discussion', ''),
+                    disc.get('title', ''),
+                    disc.get('author_steamid', ''),
+                    disc.get('author_name', ''),
+                    disc.get('timestamp_created', 0),
+                    disc.get('content_snippet', ''),
+                    disc.get('reply_count', 0),
+                    disc.get('view_count', 0),
+                    disc.get('is_pinned', 0),
+                    timestamp_now
+                ))
+            except Exception as e:
+                print(f"ERROR: Failed to insert discussion {disc.get('gid_discussion')}: {e}", flush=True)
+
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as e:
+        print(f"ERROR: Database insert failed for discussions: {e}", flush=True)
+
+
+def is_first_run_discussions():
+    """Check if this is the first run for discussions (empty table)."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM discussions')
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count == 0
+    except sqlite3.Error:
+        return True
+
+
+def fetch_and_process_discussions():
+    """Fetch discussions from Steam forums and process new ones."""
+    try:
+        # Fetch discussions via web scraping
+        discussions = fetch_discussions()
+
+        if discussions is None:
+            print("Failed to fetch discussions from Steam", flush=True)
+            return None
+
+        if not discussions:
+            print("No discussions found", flush=True)
+            return {'new_count': 0, 'discussions': [], 'is_first_run': False}
+
+        # Check if first run
+        first_run = is_first_run_discussions()
+
+        # Extract discussion IDs and check which are new
+        discussion_ids = [d.get('gid_discussion') for d in discussions if d.get('gid_discussion')]
+        existing_ids = get_existing_discussion_ids(discussion_ids)
+        new_discussions = [d for d in discussions if d.get('gid_discussion') and d.get('gid_discussion') not in existing_ids]
+
+        # If no new discussions
+        if not new_discussions:
+            return {'new_count': 0, 'discussions': [], 'is_first_run': False}
+
+        # Insert new discussions
+        insert_discussions(new_discussions)
+
+        # Filter out pinned posts from notifications (they're not "new" content)
+        new_discussions_unpinned = [d for d in new_discussions if not d.get('is_pinned')]
+
+        return {
+            'new_count': len(new_discussions_unpinned),
+            'discussions': new_discussions_unpinned[:10],  # Limit to 10 for notification
+            'is_first_run': first_run
+        }
+
+    except Exception as e:
+        print(f"ERROR: Discussion processing failed: {e}", flush=True)
+        return None
+
+
+def post_discussion_notification(disc_data):
+    """Send Discord notification for new discussions."""
+    if disc_data is None:
+        return
+
+    # Skip if no new discussions (unless configured otherwise)
+    if disc_data['new_count'] == 0:
+        if not NOTIFY_ON_ZERO_NEW:
+            print(f"SKIP No new discussions at {datetime.utcnow().isoformat()}", flush=True)
+            return
+
+    # Build message based on first run or subsequent run
+    if disc_data['is_first_run']:
+        msg = (
+            f"📌 Steam Monitor {APPID} - Discussions Initial Run\n"
+            f"💬 Loaded {disc_data['new_count']} initial discussions\n"
+            f"🕒 UTC: {datetime.utcnow():%Y-%m-%d %H:%M}"
+        )
+    else:
+        # Build detailed list with title and snippet
+        msg = f"📌 Steam Monitor {APPID} - New Discussions\n"
+        msg += f"💬 {disc_data['new_count']} new discussion(s)\n\n"
+
+        # Add detailed list (max 5 to avoid Discord message limit)
+        for i, disc in enumerate(disc_data['discussions'][:5], 1):
+            title = disc.get('title', 'Untitled')[:100]  # Truncate long titles
+            snippet = disc.get('content_snippet', 'No preview')[:150]
+            author = disc.get('author_name', 'Unknown')
+
+            # Create discussion URL
+            gid = disc.get('gid_discussion', '')
+            url = f"https://steamcommunity.com/app/{APPID}/discussions/0/{gid}/"
+
+            msg += f"{i}. **{title}**\n"
+            msg += f"   By: {author}\n"
+            if snippet:
+                msg += f"   {snippet}...\n"
+            msg += f"   {url}\n\n"
+
+        if disc_data['new_count'] > 5:
+            msg += f"... and {disc_data['new_count'] - 5} more\n\n"
+
+        msg += f"🕒 UTC: {datetime.utcnow():%Y-%m-%d %H:%M}"
+
+    # Send to Discord
+    try:
+        response = requests.post(WEBHOOK, json={"content": msg}, timeout=30)
+        response.raise_for_status()
+        print(f"OK Discussion notification sent: new={disc_data['new_count']}", flush=True)
+    except requests.RequestException as e:
+        print(f"ERROR: Discord webhook failed for discussions: {e}", flush=True)
+
+
 # Initialize database
 init_db()
 
 # Main monitoring loop
 while True:
     try:
+        # Process reviews
         stats = fetch_and_process_reviews()
         post_notification(stats)
 
-        # Log stats
+        # Log review stats
         if stats:
             print(
                 f"OK {datetime.utcnow().isoformat()} "
@@ -246,6 +553,22 @@ while True:
                 f"total_neg={stats['total_negative']} total_pos={stats['total_positive']}",
                 flush=True
             )
+
+        # Add delay between reviews and discussions to respect rate limits
+        time.sleep(5)
+
+        # Process discussions
+        disc_data = fetch_and_process_discussions()
+        post_discussion_notification(disc_data)
+
+        # Log discussion stats
+        if disc_data:
+            print(
+                f"OK {datetime.utcnow().isoformat()} "
+                f"new_discussions={disc_data['new_count']}",
+                flush=True
+            )
+
     except Exception as e:
         print(f"ERROR Unexpected error: {repr(e)}", flush=True)
 
