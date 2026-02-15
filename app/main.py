@@ -30,6 +30,7 @@ AI_SUMMARY_MAX_CHARS = int(os.environ.get("AI_SUMMARY_MAX_CHARS", "1800"))
 
 # State for AI summary scheduling
 last_summary_time = None
+first_loop_iteration = True  # Force summary on first loop (e.g., after deploy)
 
 
 # Helper functions for discussion scraping
@@ -798,7 +799,7 @@ def generate_ai_summary(reviews_data, discussions_data):
 
 def should_generate_summary():
     """Check if it's time to generate an AI summary."""
-    global last_summary_time
+    global last_summary_time, first_loop_iteration
 
     # Feature disabled
     if not ENABLE_AI_SUMMARY:
@@ -808,6 +809,11 @@ def should_generate_summary():
     if not OPENAI_API_KEY:
         print("WARNING: AI summary enabled but no OPENAI_API_KEY set", flush=True)
         return False
+
+    # Force summary on first loop iteration (e.g., after deploy/restart)
+    if first_loop_iteration:
+        print("First loop iteration - forcing AI summary generation", flush=True)
+        return True
 
     # Load last summary time from DB (if not already loaded)
     if last_summary_time is None:
@@ -944,6 +950,8 @@ init_db()
 # Main monitoring loop
 while True:
     try:
+        global first_loop_iteration
+
         # Process reviews
         stats = fetch_and_process_reviews()
         post_notification(stats)
@@ -977,6 +985,9 @@ while True:
             summary_data = fetch_and_generate_summary()
             if summary_data:
                 post_ai_summary_notification(summary_data)
+
+        # Mark first iteration as complete
+        first_loop_iteration = False
 
     except Exception as e:
         print(f"ERROR Unexpected error: {repr(e)}", flush=True)
