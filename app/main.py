@@ -293,8 +293,7 @@ def fetch_discussions():
         soup = BeautifulSoup(response.text, 'html.parser')
 
         discussions = []
-        # Find discussion containers - NOTE: These selectors may need adjustment after testing
-        # Steam forums structure: looking for discussion topics
+        # Find discussion containers
         topic_containers = soup.find_all('div', class_='forum_topic')
 
         if not topic_containers:
@@ -304,12 +303,11 @@ def fetch_discussions():
         for topic in topic_containers[:20]:  # Limit to first 20 discussions
             try:
                 # Extract discussion link and gid
-                link = topic.find('a', class_='forum_topic_name')
+                link = topic.find('a', class_='forum_topic_overlay')
                 if not link:
                     continue
 
                 href = link.get('href', '')
-                title = link.text.strip()
 
                 # Extract gid from URL pattern: .../discussions/0/GIDHERE/
                 gid_match = re.search(r'/discussions/\d+/(\d+)/', href)
@@ -318,25 +316,41 @@ def fetch_discussions():
 
                 gid = gid_match.group(1)
 
-                # Extract author information
-                author_link = topic.find('a', class_='forum_topic_author')
-                author_name = author_link.text.strip() if author_link else 'Unknown'
-                author_steamid = ''  # May need to extract from profile link if available
+                # Extract title from forum_topic_name div
+                title_div = topic.find('div', class_='forum_topic_name')
+                if not title_div:
+                    continue
+
+                # Get title text and remove "PINNED:" label if present
+                title = title_div.get_text(strip=True)
+                # Remove PINNED: prefix if it exists
+                title = re.sub(r'^PINNED:\s*', '', title)
+
+                # Extract author from forum_topic_op div
+                author_div = topic.find('div', class_='forum_topic_op')
+                author_name = author_div.get_text(strip=True) if author_div else 'Unknown'
+                author_steamid = ''  # Not available in list view
 
                 # Timestamp (using current time as fallback per plan)
                 timestamp = int(time.time())
 
-                # Reply/view counts
-                stats_div = topic.find('div', class_='forum_topic_stats')
-                reply_count = extract_number(stats_div, 'replies?') if stats_div else 0
-                view_count = 0  # Views may not be available in list view
+                # Reply count from forum_topic_reply_count div
+                reply_div = topic.find('div', class_='forum_topic_reply_count')
+                reply_count = extract_number(reply_div, '') if reply_div else 0
+                view_count = 0  # Not available in list view
 
-                # Check if pinned
-                is_pinned = 1 if topic.find(class_='forum_topic_pinned') or 'sticky' in topic.get('class', []) else 0
+                # Check if pinned (has sticky class or sticky_label)
+                is_pinned = 1 if (topic.find('span', class_='sticky_label') or 'sticky' in topic.get('class', [])) else 0
 
-                # Content snippet from preview
-                preview_div = topic.find('div', class_='forum_topic_preview')
-                content_snippet = preview_div.text.strip()[:200] if preview_div else ''
+                # Content snippet from data-tooltip-forum attribute
+                tooltip = topic.get('data-tooltip-forum', '')
+                # Extract text from tooltip HTML
+                if tooltip:
+                    tooltip_soup = BeautifulSoup(tooltip, 'html.parser')
+                    topic_hover_text = tooltip_soup.find('div', class_='topic_hover_text')
+                    content_snippet = topic_hover_text.get_text(strip=True)[:200] if topic_hover_text else ''
+                else:
+                    content_snippet = ''
 
                 discussions.append({
                     'gid_discussion': gid,
