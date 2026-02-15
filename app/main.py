@@ -5,6 +5,7 @@ import re
 import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
+from openai import OpenAI
 
 # Configuration
 APPID = os.environ["STEAM_APPID"]
@@ -17,6 +18,18 @@ URL = f"https://store.steampowered.com/appreviews/{APPID}?json=1&filter=recent&l
 
 # Cache for game name
 GAME_NAME_CACHE = None
+
+# AI Summary Configuration
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+ENABLE_AI_SUMMARY = os.environ.get("ENABLE_AI_SUMMARY", "false").lower() == "true"
+AI_SUMMARY_INTERVAL_HOURS = int(os.environ.get("AI_SUMMARY_INTERVAL_HOURS", "24"))
+AI_SUMMARY_DAYS_LOOKBACK = int(os.environ.get("AI_SUMMARY_DAYS_LOOKBACK", "7"))
+AI_SUMMARY_MODEL = os.environ.get("AI_SUMMARY_MODEL", "gpt-4o-mini")
+AI_SUMMARY_MAX_INPUT_ITEMS = int(os.environ.get("AI_SUMMARY_MAX_INPUT_ITEMS", "100"))
+AI_SUMMARY_MAX_CHARS = int(os.environ.get("AI_SUMMARY_MAX_CHARS", "1800"))
+
+# State for AI summary scheduling
+last_summary_time = None
 
 
 # Helper functions for discussion scraping
@@ -118,9 +131,18 @@ def init_db():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp_fetched_disc ON discussions(timestamp_fetched)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_is_pinned ON discussions(is_pinned)')
 
+        # Create metadata table for AI summary state
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+        ''')
+
         conn.commit()
         conn.close()
-        print("DB initialized successfully (reviews + discussions)", flush=True)
+        print("DB initialized successfully (reviews + discussions + metadata)", flush=True)
     except sqlite3.Error as e:
         print(f"ERROR: Database initialization failed: {e}", flush=True)
 
@@ -488,6 +510,98 @@ def is_first_run_discussions():
         return True
 
 
+# AI Summary Database Functions
+def get_metadata(key):
+    """Get metadata value by key."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        cursor = conn.cursor()
+        cursor.execute('SELECT value FROM metadata WHERE key = ?', (key,))
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
+    except sqlite3.Error as e:
+        print(f"ERROR: Failed to get metadata: {e}", flush=True)
+        return None
+
+
+def set_metadata(key, value):
+    """Set metadata value."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        cursor = conn.cursor()
+        timestamp_now = int(time.time())
+        cursor.execute(
+            'INSERT OR REPLACE INTO metadata (key, value, updated_at) VALUES (?, ?, ?)',
+            (key, value, timestamp_now)
+        )
+        conn.commit()
+        conn.close()
+    except sqlite3.Error as e:
+        print(f"ERROR: Failed to set metadata: {e}", flush=True)
+
+
+def get_reviews_for_summary(days_back=7, limit=100):
+    """Query reviews from last N days for AI summary."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        cursor = conn.cursor()
+
+        cutoff_time = int(time.time()) - (days_back * 24 * 60 * 60)
+        cursor.execute('''
+            SELECT review, voted_up, timestamp_created
+            FROM reviews
+            WHERE timestamp_created > ?
+            ORDER BY timestamp_created DESC
+            LIMIT ?
+        ''', (cutoff_time, limit))
+
+        reviews = []
+        for row in cursor.fetchall():
+            reviews.append({
+                'review': row[0],
+                'voted_up': row[1],
+                'timestamp_created': row[2]
+            })
+
+        conn.close()
+        return reviews
+    except sqlite3.Error as e:
+        print(f"ERROR: Failed to fetch reviews for summary: {e}", flush=True)
+        return []
+
+
+def get_discussions_for_summary(days_back=7, limit=100):
+    """Query discussions from last N days for AI summary."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        cursor = conn.cursor()
+
+        cutoff_time = int(time.time()) - (days_back * 24 * 60 * 60)
+        cursor.execute('''
+            SELECT title, content_snippet, reply_count, timestamp_created
+            FROM discussions
+            WHERE timestamp_created > ? AND is_pinned = 0
+            ORDER BY timestamp_created DESC
+            LIMIT ?
+        ''', (cutoff_time, limit))
+
+        discussions = []
+        for row in cursor.fetchall():
+            discussions.append({
+                'title': row[0],
+                'content_snippet': row[1],
+                'reply_count': row[2],
+                'timestamp_created': row[3]
+            })
+
+        conn.close()
+        return discussions
+    except sqlite3.Error as e:
+        print(f"ERROR: Failed to fetch discussions for summary: {e}", flush=True)
+        return []
+
+
 def fetch_and_process_discussions():
     """Fetch discussions from Steam forums and process new ones."""
     try:
@@ -587,6 +701,243 @@ def post_discussion_notification(disc_data):
         print(f"ERROR: Discord webhook failed for discussions: {e}", flush=True)
 
 
+# AI Summary Functions
+def format_reviews_for_prompt(reviews):
+    """Format reviews for inclusion in OpenAI prompt."""
+    formatted = []
+    for r in reviews:
+        text = r.get('review', '')[:200] if r.get('review') else "No text"
+        formatted.append(f"- {text}")
+    return "\n".join(formatted)
+
+
+def format_discussions_for_prompt(discussions):
+    """Format discussions for inclusion in OpenAI prompt."""
+    formatted = []
+    for d in discussions:
+        title = d.get('title', '')[:100]
+        snippet = d.get('content_snippet', '')[:150] if d.get('content_snippet') else ""
+        replies = d.get('reply_count', 0)
+        formatted.append(f"- {title} ({replies} replies)\n  {snippet}")
+    return "\n".join(formatted)
+
+
+def build_summary_prompt(reviews_data, discussions_data):
+    """Build structured prompt for OpenAI API."""
+    game_name = get_game_name()
+    days = AI_SUMMARY_DAYS_LOOKBACK
+
+    # Count positive/negative
+    positive = [r for r in reviews_data if r.get('voted_up')]
+    negative = [r for r in reviews_data if not r.get('voted_up')]
+
+    prompt = f"""Analyze the following Steam community feedback for {game_name} from the last {days} days.
+
+REVIEWS ({len(reviews_data)} total: {len(positive)} positive, {len(negative)} negative):
+
+POSITIVE REVIEWS:
+{format_reviews_for_prompt(positive[:30])}
+
+NEGATIVE REVIEWS:
+{format_reviews_for_prompt(negative[:30])}
+
+DISCUSSIONS ({len(discussions_data)} topics):
+{format_discussions_for_prompt(discussions_data[:40])}
+
+Please provide a comprehensive summary covering:
+1. Best feedback and highlights (what players love)
+2. Worst feedback and pain points (what players dislike)
+3. Recurring problems or themes (mentioned multiple times)
+4. Overall sentiment analysis (trend: improving/declining/stable)
+
+Keep the summary under 1000 words and focus on actionable insights for developers."""
+
+    return prompt
+
+
+def generate_ai_summary(reviews_data, discussions_data):
+    """Generate AI summary using OpenAI API."""
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+
+        # Build prompt with structured data
+        prompt = build_summary_prompt(reviews_data, discussions_data)
+
+        # API call with configured model
+        max_tokens = int(AI_SUMMARY_MAX_CHARS / 0.75)  # ~4 chars per token
+
+        response = client.chat.completions.create(
+            model=AI_SUMMARY_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a game community analyst who summarizes player feedback to help developers understand community sentiment and key issues."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=max_tokens,
+            temperature=0.7
+        )
+
+        summary = response.choices[0].message.content
+
+        # Log token usage for cost tracking
+        usage = response.usage
+        cost_input = usage.prompt_tokens * 0.00000015 if AI_SUMMARY_MODEL == "gpt-4o-mini" else usage.prompt_tokens * 0.0000025
+        cost_output = usage.completion_tokens * 0.0000006 if AI_SUMMARY_MODEL == "gpt-4o-mini" else usage.completion_tokens * 0.00001
+        total_cost = cost_input + cost_output
+        print(f"OpenAI tokens: input={usage.prompt_tokens}, output={usage.completion_tokens}, cost=${total_cost:.4f}", flush=True)
+
+        # Trim to max length if needed
+        if len(summary) > AI_SUMMARY_MAX_CHARS:
+            summary = summary[:AI_SUMMARY_MAX_CHARS-3] + "..."
+
+        return summary
+
+    except Exception as e:
+        print(f"ERROR: OpenAI API failed: {e}", flush=True)
+        return None
+
+
+def should_generate_summary():
+    """Check if it's time to generate an AI summary."""
+    global last_summary_time
+
+    # Feature disabled
+    if not ENABLE_AI_SUMMARY:
+        return False
+
+    # No API key configured
+    if not OPENAI_API_KEY:
+        print("WARNING: AI summary enabled but no OPENAI_API_KEY set", flush=True)
+        return False
+
+    # Load last summary time from DB (if not already loaded)
+    if last_summary_time is None:
+        last_summary_str = get_metadata("last_summary_timestamp")
+        if last_summary_str:
+            last_summary_time = int(last_summary_str)
+
+    # Calculate interval
+    interval_seconds = AI_SUMMARY_INTERVAL_HOURS * 3600
+    current_time = int(time.time())
+
+    # First run or interval elapsed
+    if last_summary_time is None:
+        return True
+
+    return (current_time - last_summary_time) >= interval_seconds
+
+
+def fetch_and_generate_summary():
+    """Fetch data and generate AI summary."""
+    global last_summary_time
+
+    try:
+        # Fetch data for summary
+        reviews_data = get_reviews_for_summary(AI_SUMMARY_DAYS_LOOKBACK, AI_SUMMARY_MAX_INPUT_ITEMS)
+        discussions_data = get_discussions_for_summary(AI_SUMMARY_DAYS_LOOKBACK, AI_SUMMARY_MAX_INPUT_ITEMS)
+
+        # Check if we have any data
+        if not reviews_data and not discussions_data:
+            print(f"SKIP No data for AI summary (last {AI_SUMMARY_DAYS_LOOKBACK} days)", flush=True)
+            return None
+
+        print(f"Generating AI summary: {len(reviews_data)} reviews, {len(discussions_data)} discussions", flush=True)
+
+        # Generate summary
+        summary = generate_ai_summary(reviews_data, discussions_data)
+
+        if summary:
+            # Update last summary time
+            last_summary_time = int(time.time())
+            set_metadata("last_summary_timestamp", str(last_summary_time))
+
+            return {
+                'summary': summary,
+                'review_count': len(reviews_data),
+                'discussion_count': len(discussions_data),
+                'days_analyzed': AI_SUMMARY_DAYS_LOOKBACK
+            }
+
+        return None
+
+    except Exception as e:
+        print(f"ERROR: AI summary generation failed: {e}", flush=True)
+        return None
+
+
+def split_text_smart(text, max_length):
+    """Split text at paragraph boundaries for readability."""
+    if len(text) <= max_length:
+        return [text]
+
+    chunks = []
+    current = ""
+
+    # Split by paragraphs first
+    paragraphs = text.split("\n\n")
+
+    for para in paragraphs:
+        if len(current) + len(para) + 2 <= max_length:
+            current += para + "\n\n"
+        else:
+            if current:
+                chunks.append(current.strip())
+            current = para + "\n\n"
+
+    if current:
+        chunks.append(current.strip())
+
+    return chunks
+
+
+def send_discord_message(msg):
+    """Send single message to Discord webhook."""
+    try:
+        response = requests.post(WEBHOOK, json={"content": msg}, timeout=30)
+        response.raise_for_status()
+        print(f"OK Discord message sent ({len(msg)} chars)", flush=True)
+    except requests.RequestException as e:
+        print(f"ERROR: Discord webhook failed: {e}", flush=True)
+
+
+def post_ai_summary_notification(summary_data):
+    """Send AI summary to Discord (may split into multiple messages)."""
+    if not summary_data:
+        return
+
+    game_name = get_game_name()
+    summary_text = summary_data['summary']
+
+    # Build header
+    header = (
+        f"🤖 **AI Summary - {game_name}** (Steam ID: {APPID})\n"
+        f"📊 Analyzed: {summary_data['review_count']} reviews, "
+        f"{summary_data['discussion_count']} discussions "
+        f"({summary_data['days_analyzed']} days)\n"
+        f"🕒 UTC: {datetime.utcnow():%Y-%m-%d %H:%M}\n\n"
+    )
+
+    # Calculate available space for summary (leave room for header)
+    max_msg_len = 1950  # Safe margin under 2000
+    header_len = len(header)
+
+    # Split summary if needed
+    if header_len + len(summary_text) <= max_msg_len:
+        # Single message
+        send_discord_message(header + summary_text)
+    else:
+        # Multiple messages
+        send_discord_message(header + "(Summary split into multiple parts)")
+
+        # Split summary into chunks
+        chunk_size = max_msg_len - 50  # Room for "Part X/Y"
+        chunks = split_text_smart(summary_text, chunk_size)
+
+        for i, chunk in enumerate(chunks, 1):
+            prefix = f"**[Part {i}/{len(chunks)}]**\n\n" if len(chunks) > 1 else ""
+            send_discord_message(prefix + chunk)
+            time.sleep(1)  # Rate limit courtesy
+
+
 # Initialize database
 init_db()
 
@@ -620,6 +971,12 @@ while True:
                 f"new_discussions={disc_data['new_count']}",
                 flush=True
             )
+
+        # Check if time for AI summary
+        if should_generate_summary():
+            summary_data = fetch_and_generate_summary()
+            if summary_data:
+                post_ai_summary_notification(summary_data)
 
     except Exception as e:
         print(f"ERROR Unexpected error: {repr(e)}", flush=True)
