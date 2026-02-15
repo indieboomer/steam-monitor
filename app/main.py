@@ -15,6 +15,9 @@ DB_PATH = "/data/reviews.db"
 
 URL = f"https://store.steampowered.com/appreviews/{APPID}?json=1&filter=recent&language=all&num_per_page=20"
 
+# Cache for game name
+GAME_NAME_CACHE = None
+
 
 # Helper functions for discussion scraping
 def parse_steam_timestamp(text):
@@ -37,6 +40,35 @@ def extract_number(element, keyword):
         return int(match.group(1)) if match else 0
     except:
         return 0
+
+
+def get_game_name():
+    """Fetch game name from Steam Store API. Returns game name or APPID as fallback."""
+    global GAME_NAME_CACHE
+
+    # Return cached value if available
+    if GAME_NAME_CACHE:
+        return GAME_NAME_CACHE
+
+    try:
+        url = f"https://store.steampowered.com/api/appdetails?appids={APPID}"
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get(APPID, {}).get('success'):
+            game_name = data[APPID]['data'].get('name', APPID)
+            GAME_NAME_CACHE = game_name
+            print(f"Fetched game name: {game_name}", flush=True)
+            return game_name
+        else:
+            print(f"WARNING: Could not fetch game name, using APPID", flush=True)
+            GAME_NAME_CACHE = APPID
+            return APPID
+    except Exception as e:
+        print(f"ERROR: Failed to fetch game name: {e}, using APPID", flush=True)
+        GAME_NAME_CACHE = APPID
+        return APPID
 
 
 def init_db():
@@ -251,17 +283,20 @@ def post_notification(stats):
             print(f"SKIP No new reviews at {datetime.utcnow().isoformat()}", flush=True)
             return
 
+    # Get game name
+    game_name = get_game_name()
+
     # Build message based on first run or subsequent run
     if stats['is_first_run']:
         msg = (
-            f"📌 Steam Monitor {APPID} - Initial Run\n"
+            f"📌 **{game_name}** (Steam ID: {APPID}) - Reviews Initial Run\n"
             f"📝 Loaded {stats['new_positive'] + stats['new_negative']} initial reviews\n"
             f"👎 {stats['new_negative']} / 👍 {stats['new_positive']}\n"
             f"🕒 UTC: {datetime.utcnow():%Y-%m-%d %H:%M}"
         )
     else:
         msg = (
-            f"📌 Steam Monitor {APPID}\n"
+            f"📌 **{game_name}** (Steam ID: {APPID})\n"
             f"🆕 NEW: 👎 {stats['new_negative']} / 👍 {stats['new_positive']}\n"
             f"📊 TOTAL: 👎 {stats['total_negative']} / 👍 {stats['total_positive']}\n"
             f"🕒 UTC: {datetime.utcnow():%Y-%m-%d %H:%M}"
@@ -507,16 +542,19 @@ def post_discussion_notification(disc_data):
             print(f"SKIP No new discussions at {datetime.utcnow().isoformat()}", flush=True)
             return
 
+    # Get game name
+    game_name = get_game_name()
+
     # Build message based on first run or subsequent run
     if disc_data['is_first_run']:
         msg = (
-            f"📌 Steam Monitor {APPID} - Discussions Initial Run\n"
+            f"📌 **{game_name}** (Steam ID: {APPID}) - Discussions Initial Run\n"
             f"💬 Loaded {disc_data['new_count']} initial discussions\n"
             f"🕒 UTC: {datetime.utcnow():%Y-%m-%d %H:%M}"
         )
     else:
         # Build detailed list with title and snippet
-        msg = f"📌 Steam Monitor {APPID} - New Discussions\n"
+        msg = f"📌 **{game_name}** (Steam ID: {APPID}) - New Discussions\n"
         msg += f"💬 {disc_data['new_count']} new discussion(s)\n\n"
 
         # Add detailed list (max 5 to avoid Discord message limit)
