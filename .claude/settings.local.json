@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:steamcommunity.com)",
+      "WebFetch(domain:store.steampowered.com)"
+    ]
+  }
+}

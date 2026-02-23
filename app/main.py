@@ -14,7 +14,18 @@ CHECK_MIN = int(os.environ.get("CHECK_EVERY_MINUTES", "360"))
 NOTIFY_ON_ZERO_NEW = os.environ.get("NOTIFY_ON_ZERO_NEW", "false").lower() == "true"
 DB_PATH = "/data/reviews.db"
 
-URL = f"https://store.steampowered.com/appreviews/{APPID}?json=1&filter=recent&language=all&num_per_page=20"
+URL = f"https://store.steampowered.com/appreviews/{APPID}?json=1&filter=recent&language=all&num_per_page=20&purchase_type=all"
+
+# Cookies to bypass Steam age-gate for mature content games
+STEAM_COOKIES = {
+    'birthtime': '315532800',    # Born January 1, 1980 (proves 18+ age)
+    'lastagecheckage': '1-1-1980',
+    'wants_mature_content': '1',
+}
+
+STEAM_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+}
 
 # Cache for game name
 GAME_NAME_CACHE = None
@@ -66,7 +77,7 @@ def get_game_name():
 
     try:
         url = f"https://store.steampowered.com/api/appdetails?appids={APPID}"
-        response = requests.get(url, timeout=30)
+        response = requests.get(url, headers=STEAM_HEADERS, cookies=STEAM_COOKIES, timeout=30)
         response.raise_for_status()
         data = response.json()
 
@@ -243,12 +254,25 @@ def is_first_run():
 def fetch_and_process_reviews():
     """Fetch reviews from Steam API and process new ones."""
     try:
-        # Fetch reviews from Steam API
-        data = requests.get(URL, timeout=30).json()
+        # Fetch reviews from Steam API (cookies bypass age gate for mature games)
+        response = requests.get(URL, headers=STEAM_HEADERS, cookies=STEAM_COOKIES, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+
+        # Log query summary for diagnostics
+        query_summary = data.get("query_summary", {})
+        if query_summary:
+            print(
+                f"API query_summary: total={query_summary.get('total_reviews', 0)}, "
+                f"positive={query_summary.get('total_positive', 0)}, "
+                f"negative={query_summary.get('total_negative', 0)}",
+                flush=True
+            )
+
         reviews = data.get("reviews", [])
 
         if not reviews:
-            print("No reviews fetched from API", flush=True)
+            print(f"No reviews in API response (success={data.get('success')}, cursor={data.get('cursor', 'N/A')})", flush=True)
             return None
 
         # Check if first run
@@ -340,22 +364,27 @@ def fetch_discussions():
     url = f"https://steamcommunity.com/app/{APPID}/discussions/0/"
 
     try:
-        # Add headers to mimic browser request
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers, timeout=30)
+        # Use cookies to bypass age gate for mature content games
+        response = requests.get(url, headers=STEAM_HEADERS, cookies=STEAM_COOKIES, timeout=30)
         response.raise_for_status()
 
         # Parse HTML with BeautifulSoup
         soup = BeautifulSoup(response.text, 'html.parser')
+
+        # Detect age gate page (Steam shows content warning before forum)
+        age_gate = soup.find('div', class_='agegate_box') or soup.find('form', id='agecheck_form')
+        if age_gate:
+            print("WARNING: Steam age gate encountered - cookies may not have worked", flush=True)
+            return []
 
         discussions = []
         # Find discussion containers
         topic_containers = soup.find_all('div', class_='forum_topic')
 
         if not topic_containers:
-            print("WARNING: No discussion containers found - HTML structure may have changed", flush=True)
+            # Log part of the page to help debug HTML structure
+            page_title = soup.find('title')
+            print(f"WARNING: No discussion containers found (page: {page_title.text.strip() if page_title else 'unknown'})", flush=True)
             return []
 
         for topic in topic_containers[:20]:  # Limit to first 20 discussions
